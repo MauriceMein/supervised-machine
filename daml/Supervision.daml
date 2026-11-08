@@ -1,37 +1,66 @@
--- The Supervised Machine: AI agents that can only act inside a mandate
--- a licensed human signed, and whose work counts only after that human reviews it.
+-- The Supervised Machine: a local model of professional-party delegation.
+-- Human identity, licensing, model execution and settlement are not verified.
 -- Reference sketch for research purposes. Synthetic data only. Not legal advice.
 module Supervision where
 
--- What the agent is allowed to do. Anything else is impossible, not just forbidden.
+-- Allowed action labels for creating draft records through the mandate.
 data ActionKind
   = DraftDocument
   | SummarizeRecords
   | SendClientUpdate
   deriving (Eq, Show)
 
--- Step 1: the licensed professional offers a mandate. The client must accept.
+-- Step 1: the professional party offers a mandate. The client must accept.
 template MandateProposal
   with
-    professional : Party   -- licensed human who answers for the work
+    professional : Party   -- professional party; license verification is external
     client       : Party
     agent        : Party   -- the AI agent's party
-    matterHash   : Text    -- hash of the matter ID; no client content on ledger
+    matterHash   : Text    -- caller-supplied reference; never submit confidential content
     allowed      : [ActionKind]
     feeCapCents  : Int     -- total the agent may spend on approved fees
     payees       : [Party] -- the only parties the agent may pay
+    reviewRecipients : [Party] -- client-approved receipt recipients
     expires      : Time
   where
     signatory professional
     observer client
-    ensure feeCapCents >= 0
+    ensure feeCapCents >= 0 && agent /= professional && agent /= client
 
     choice Accept : ContractId SupervisionMandate
       controller client
-      do create SupervisionMandate with
+      do
+        statusCid <- create MandateStatus with
+          professional = professional; client = client; agent = agent
+          matterHash = matterHash; expires = expires; reviewRecipients = reviewRecipients
+        create SupervisionMandate with
            professional = professional; client = client; agent = agent
            matterHash = matterHash; allowed = allowed; feeCapCents = feeCapCents
-           spentCents = 0; payees = payees; expires = expires
+           spentCents = 0; payees = payees; expires = expires; statusCid = statusCid
+
+-- Stable lifetime/recipient control. Fee updates retain this contract ID.
+template MandateStatus
+  with
+    professional : Party
+    client : Party
+    agent : Party
+    matterHash : Text
+    expires : Time
+    reviewRecipients : [Party]
+  where
+    signatory professional, client
+    observer agent
+    ensure agent /= professional && agent /= client
+
+checkLiveStatus : ContractId MandateStatus -> Party -> Party -> Party -> Text -> Update MandateStatus
+checkLiveStatus cid professional client agent matterHash = do
+  status <- fetch cid
+  assertMsg "Mismatched mandate status"
+    (status.professional == professional && status.client == client
+      && status.agent == agent && status.matterHash == matterHash)
+  now <- getTime
+  assertMsg "Mandate expired" (now < status.expires)
+  pure status
 
 -- Step 2: the live mandate. Signed by professional AND client.
 -- The agent is only an observer and the controller of a few narrow choices.
@@ -46,12 +75,14 @@ template SupervisionMandate
     spentCents   : Int
     payees       : [Party]
     expires      : Time
+    statusCid    : ContractId MandateStatus
   where
     signatory professional, client
     observer agent
     ensure spentCents >= 0 && spentCents <= feeCapCents
+      && agent /= professional && agent /= client
 
-    -- The agent produces work. It lands as a DRAFT that only the professional can approve.
+    -- The agent records output references; the professional party controls approval.
     nonconsuming choice ProduceDraft : ContractId AgentDraft
       with
         kind       : ActionKind
@@ -60,15 +91,14 @@ template SupervisionMandate
         modelId    : Text   -- model name and version
       controller agent
       do
-        now <- getTime
-        assertMsg "Mandate expired" (now < expires)
+        _ <- checkLiveStatus statusCid professional client agent matterHash
         assertMsg "Action not in mandate" (kind `elem` allowed)
         create AgentDraft with
           professional = professional; client = client; agent = agent
           matterHash = matterHash; kind = kind; inputHash = inputHash
-          outputHash = outputHash; modelId = modelId
+          outputHash = outputHash; modelId = modelId; statusCid = statusCid
 
-    -- The agent pays an approved fee, to an approved payee, under the cap.
+    -- Record an approved fee under the cap. This does not transfer tokens.
     -- Consuming: the mandate is re-created with the new running total.
     choice PayFee : (ContractId SupervisionMandate, ContractId FeePayment)
       with
@@ -77,8 +107,7 @@ template SupervisionMandate
         memoHash    : Text
       controller agent
       do
-        now <- getTime
-        assertMsg "Mandate expired" (now < expires)
+        _ <- checkLiveStatus statusCid professional client agent matterHash
         assertMsg "Payee not approved" (payee `elem` payees)
         assertMsg "Amount must be positive" (amountCents > 0)
         assertMsg "Over fee cap" (spentCents + amountCents <= feeCapCents)
@@ -92,13 +121,13 @@ template SupervisionMandate
     -- Either the professional or the client can end the mandate at any time.
     choice RevokeByProfessional : ()
       controller professional
-      do pure ()
+      do archive statusCid
 
     choice RevokeByClient : ()
       controller client
-      do pure ()
+      do archive statusCid
 
--- AI output waiting for review. Not usable for anything until approved.
+-- A draft record. Approval/rejection consumes it; external tools are not gated here.
 template AgentDraft
   with
     professional : Party
@@ -109,11 +138,12 @@ template AgentDraft
     inputHash    : Text
     outputHash   : Text
     modelId      : Text
+    statusCid    : ContractId MandateStatus
   where
     signatory professional, client
     observer agent
 
-    -- Only the licensed human can turn a draft into reviewed work.
+    -- The professional party controls approval; this does not authenticate a human.
     choice Approve : ContractId ReviewedWork
       with
         citationsChecked : Bool
@@ -121,6 +151,9 @@ template AgentDraft
         discloseTo       : [Party]  -- e.g. the court. Sees the receipt, not the content
       controller professional
       do
+        status <- checkLiveStatus statusCid professional client agent matterHash
+        assertMsg "Receipt recipient not approved"
+          (all (\p -> p `elem` status.reviewRecipients) discloseTo)
         assertMsg "Citations must be checked before approval" citationsChecked
         reviewedAt <- getTime
         create ReviewedWork with
@@ -135,8 +168,8 @@ template AgentDraft
       controller professional
       do pure ()
 
--- Proof of licensed review. A court can see THAT a named professional approved
--- this exact output (by hash), when, and with which model, without seeing the work.
+-- Review attestation with caller-supplied document/model references.
+-- A verifier must check trusted identities, document binding and creation provenance.
 template ReviewedWork
   with
     professional     : Party
@@ -154,8 +187,9 @@ template ReviewedWork
   where
     signatory professional, client
     observer agent, discloseTo
+    ensure citationsChecked && agent /= professional && agent /= client
 
--- Record of an agent fee payment. Settlement (e.g. a CIP-56 token transfer)
+-- Metadata-only fee record. Settlement (e.g. a CIP-56 token transfer)
 -- would hang off this in a real build; out of scope for the sketch.
 template FeePayment
   with

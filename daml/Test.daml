@@ -30,6 +30,7 @@ setup = do
       allowed = [DraftDocument, SummarizeRecords]
       feeCapCents = 5000
       payees = [recordsOffice]
+      reviewRecipients = [court]
       expires = addRelTime now (days 30)
   mandate <- submit client do exerciseCmd prop Accept
   pure World with
@@ -108,7 +109,7 @@ testFeeLimits = do
     exerciseCmd m2 PayFee with
       payee = w.opposing; amountCents = 100; memoHash = "wrong-payee"
 
--- 7. Client revokes; agent is locked out.
+-- 7. Client revokes; the old mandate rejects new drafts.
 testRevocation : Script ()
 testRevocation = do
   w <- setup
@@ -126,7 +127,7 @@ testExpiry = do
     exerciseCmd w.mandate ProduceDraft with
       kind = DraftDocument; inputHash = "x"; outputHash = "y"; modelId = "m"
 
--- 9. Privacy: opposing counsel sees nothing; court sees only what was disclosed.
+-- 9. Privacy (this test ledger only): opposing counsel cannot query mandates or drafts; the court cannot query drafts.
 testPrivacy : Script ()
 testPrivacy = do
   w <- setup

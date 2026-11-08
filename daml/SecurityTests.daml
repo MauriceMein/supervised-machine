@@ -1,0 +1,125 @@
+module SecurityTests where
+import Daml.Script
+import DA.Time (days)
+import Supervision
+import Test (World(..), setup)
+
+makeDraft : World -> Script (ContractId AgentDraft)
+makeDraft w = submit w.agent do
+  exerciseCmd w.mandate ProduceDraft with
+    kind = DraftDocument; inputHash = "plaintext private input"; outputHash = "plaintext private output"; modelId = "unattested-model"
+
+probeApproveAfterRevocation : Script ()
+
+probeApproveAfterRevocation = do
+  w <- setup
+  d <- makeDraft w
+  submit w.client do
+    exerciseCmd w.mandate RevokeByClient
+  submitMustFail w.lawyer do
+    exerciseCmd d Approve with
+      citationsChecked = True; reviewNoteHash = "n"; discloseTo = [w.court]
+
+probeApproveAfterExpiry : Script ()
+
+probeApproveAfterExpiry = do
+  w <- setup
+  d <- makeDraft w
+  passTime (days 31)
+  submitMustFail w.lawyer do
+    exerciseCmd d Approve with
+      citationsChecked = True; reviewNoteHash = "n"; discloseTo = [w.court]
+
+probeDisclosureToOpposing : Script ()
+
+probeDisclosureToOpposing = do
+  w <- setup
+  d <- makeDraft w
+  submitMustFail w.lawyer do
+    exerciseCmd d Approve with
+      citationsChecked = True; reviewNoteHash = "n"; discloseTo = [w.opposing]
+
+probeDirectUncheckedReview : Script ()
+probeDirectUncheckedReview = do
+  w <- setup
+  now <- getTime
+  submitMultiMustFail [w.lawyer, w.client] [] do
+    createCmd ReviewedWork with
+      professional = w.lawyer; client = w.client; agent = w.agent
+      matterHash = "never-authorized"; kind = SendClientUpdate
+      inputHash = "not-a-hash"; outputHash = "private raw text"; modelId = "invented"
+      citationsChecked = False; reviewNoteHash = ""; discloseTo = [w.court]; reviewedAt = now
+
+probeAgentAliasesProfessional : Script ()
+probeAgentAliasesProfessional = do
+  w <- setup
+  now <- getTime
+  submitMustFail w.agent do
+    createCmd ReviewedWork with
+      professional = w.agent; client = w.agent; agent = w.agent
+      matterHash = "x"; kind = DraftDocument; inputHash = "x"; outputHash = "y"; modelId = "m"
+      citationsChecked = True; reviewNoteHash = ""; discloseTo = [w.court]; reviewedAt = now
+
+
+probeFeeBoundaries : Script ()
+probeFeeBoundaries = do
+  w <- setup
+  submitMustFail w.agent do
+    exerciseCmd w.mandate PayFee with
+      payee = w.recordsOffice; amountCents = 0; memoHash = "zero"
+  submitMustFail w.agent do
+    exerciseCmd w.mandate PayFee with
+      payee = w.recordsOffice; amountCents = -1; memoHash = "negative"
+  (m2, _) <- submit w.agent do
+    exerciseCmd w.mandate PayFee with
+      payee = w.recordsOffice; amountCents = 5000; memoHash = "exact-cap"
+  submitMustFail w.agent do
+    exerciseCmd w.mandate PayFee with
+      payee = w.recordsOffice; amountCents = 1; memoHash = "replay-old-id"
+  submitMustFail w.agent do
+    exerciseCmd m2 PayFee with
+      payee = w.recordsOffice; amountCents = 1; memoHash = "cap-exhausted"
+
+probeProfessionalRevocationAndExpiredFees : Script ()
+probeProfessionalRevocationAndExpiredFees = do
+  w <- setup
+  submit w.lawyer do
+    exerciseCmd w.mandate RevokeByProfessional
+  submitMustFail w.agent do
+    exerciseCmd w.mandate PayFee with
+      payee = w.recordsOffice; amountCents = 1; memoHash = "revoked"
+  w2 <- setup
+  passTime (days 31)
+  submitMustFail w2.agent do
+    exerciseCmd w2.mandate PayFee with
+      payee = w2.recordsOffice; amountCents = 1; memoHash = "expired"
+
+probeConsumingApproval : Script ()
+probeConsumingApproval = do
+  w <- setup
+  d <- makeDraft w
+  _ <- submit w.lawyer do
+    exerciseCmd d Approve with
+      citationsChecked = True; reviewNoteHash = "n"; discloseTo = []
+  submitMustFail w.lawyer do
+    exerciseCmd d Approve with
+      citationsChecked = True; reviewNoteHash = "n"; discloseTo = []
+
+probeRepeatedDrafts : Script ()
+probeRepeatedDrafts = do
+  w <- setup
+  d1 <- makeDraft w
+  d2 <- makeDraft w
+  assertMsg "Repeated identical draft creation succeeds" (d1 /= d2)
+
+probeDraftSurvivesFeeUpdate : Script ()
+probeDraftSurvivesFeeUpdate = do
+  w <- setup
+  d <- makeDraft w
+  _ <- submit w.agent do
+    exerciseCmd w.mandate PayFee with
+      payee = w.recordsOffice; amountCents = 1; memoHash = "fee-update"
+  _ <- submit w.lawyer do
+    exerciseCmd d Approve with
+      citationsChecked = True; reviewNoteHash = "n"; discloseTo = [w.court]
+  pure ()
