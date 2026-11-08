@@ -1,0 +1,171 @@
+-- The Supervised Machine: AI agents that can only act inside a mandate
+-- a licensed human signed, and whose work counts only after that human reviews it.
+-- Reference sketch for research purposes. Synthetic data only. Not legal advice.
+module Supervision where
+
+-- What the agent is allowed to do. Anything else is impossible, not just forbidden.
+data ActionKind
+  = DraftDocument
+  | SummarizeRecords
+  | SendClientUpdate
+  deriving (Eq, Show)
+
+-- Step 1: the licensed professional offers a mandate. The client must accept.
+template MandateProposal
+  with
+    professional : Party   -- licensed human who answers for the work
+    client       : Party
+    agent        : Party   -- the AI agent's party
+    matterHash   : Text    -- hash of the matter ID; no client content on ledger
+    allowed      : [ActionKind]
+    feeCapCents  : Int     -- total the agent may spend on approved fees
+    payees       : [Party] -- the only parties the agent may pay
+    expires      : Time
+  where
+    signatory professional
+    observer client
+    ensure feeCapCents >= 0
+
+    choice Accept : ContractId SupervisionMandate
+      controller client
+      do create SupervisionMandate with
+           professional = professional; client = client; agent = agent
+           matterHash = matterHash; allowed = allowed; feeCapCents = feeCapCents
+           spentCents = 0; payees = payees; expires = expires
+
+-- Step 2: the live mandate. Signed by professional AND client.
+-- The agent is only an observer and the controller of a few narrow choices.
+template SupervisionMandate
+  with
+    professional : Party
+    client       : Party
+    agent        : Party
+    matterHash   : Text
+    allowed      : [ActionKind]
+    feeCapCents  : Int
+    spentCents   : Int
+    payees       : [Party]
+    expires      : Time
+  where
+    signatory professional, client
+    observer agent
+    ensure spentCents >= 0 && spentCents <= feeCapCents
+
+    -- The agent produces work. It lands as a DRAFT that only the professional can approve.
+    nonconsuming choice ProduceDraft : ContractId AgentDraft
+      with
+        kind       : ActionKind
+        inputHash  : Text   -- hash of the input documents
+        outputHash : Text   -- hash of the AI output
+        modelId    : Text   -- model name and version
+      controller agent
+      do
+        now <- getTime
+        assertMsg "Mandate expired" (now < expires)
+        assertMsg "Action not in mandate" (kind `elem` allowed)
+        create AgentDraft with
+          professional = professional; client = client; agent = agent
+          matterHash = matterHash; kind = kind; inputHash = inputHash
+          outputHash = outputHash; modelId = modelId
+
+    -- The agent pays an approved fee, to an approved payee, under the cap.
+    -- Consuming: the mandate is re-created with the new running total.
+    choice PayFee : (ContractId SupervisionMandate, ContractId FeePayment)
+      with
+        payee       : Party
+        amountCents : Int
+        memoHash    : Text
+      controller agent
+      do
+        now <- getTime
+        assertMsg "Mandate expired" (now < expires)
+        assertMsg "Payee not approved" (payee `elem` payees)
+        assertMsg "Amount must be positive" (amountCents > 0)
+        assertMsg "Over fee cap" (spentCents + amountCents <= feeCapCents)
+        m <- create this with spentCents = spentCents + amountCents
+        p <- create FeePayment with
+          professional = professional; client = client; agent = agent
+          matterHash = matterHash; payee = payee; amountCents = amountCents
+          memoHash = memoHash
+        pure (m, p)
+
+    -- Either the professional or the client can end the mandate at any time.
+    choice RevokeByProfessional : ()
+      controller professional
+      do pure ()
+
+    choice RevokeByClient : ()
+      controller client
+      do pure ()
+
+-- AI output waiting for review. Not usable for anything until approved.
+template AgentDraft
+  with
+    professional : Party
+    client       : Party
+    agent        : Party
+    matterHash   : Text
+    kind         : ActionKind
+    inputHash    : Text
+    outputHash   : Text
+    modelId      : Text
+  where
+    signatory professional, client
+    observer agent
+
+    -- Only the licensed human can turn a draft into reviewed work.
+    choice Approve : ContractId ReviewedWork
+      with
+        citationsChecked : Bool
+        reviewNoteHash   : Text
+        discloseTo       : [Party]  -- e.g. the court. Sees the receipt, not the content
+      controller professional
+      do
+        assertMsg "Citations must be checked before approval" citationsChecked
+        reviewedAt <- getTime
+        create ReviewedWork with
+          professional = professional; client = client; agent = agent
+          matterHash = matterHash; kind = kind; inputHash = inputHash
+          outputHash = outputHash; modelId = modelId
+          citationsChecked = citationsChecked; reviewNoteHash = reviewNoteHash
+          discloseTo = discloseTo; reviewedAt = reviewedAt
+
+    choice Reject : ()
+      with reasonHash : Text
+      controller professional
+      do pure ()
+
+-- Proof of licensed review. A court can see THAT a named professional approved
+-- this exact output (by hash), when, and with which model, without seeing the work.
+template ReviewedWork
+  with
+    professional     : Party
+    client           : Party
+    agent            : Party
+    matterHash       : Text
+    kind             : ActionKind
+    inputHash        : Text
+    outputHash       : Text
+    modelId          : Text
+    citationsChecked : Bool
+    reviewNoteHash   : Text
+    discloseTo       : [Party]
+    reviewedAt       : Time
+  where
+    signatory professional, client
+    observer agent, discloseTo
+
+-- Record of an agent fee payment. Settlement (e.g. a CIP-56 token transfer)
+-- would hang off this in a real build; out of scope for the sketch.
+template FeePayment
+  with
+    professional : Party
+    client       : Party
+    agent        : Party
+    matterHash   : Text
+    payee        : Party
+    amountCents  : Int
+    memoHash     : Text
+  where
+    signatory professional, client
+    observer agent, payee

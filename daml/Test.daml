@@ -1,0 +1,142 @@
+module Test where
+
+import Daml.Script
+import DA.Time (days, addRelTime)
+import DA.Optional (isSome)
+import Supervision
+
+data World = World with
+    lawyer : Party
+    client : Party
+    agent : Party
+    court : Party
+    opposing : Party
+    recordsOffice : Party
+    mandate : ContractId SupervisionMandate
+
+setup : Script World
+setup = do
+  lawyer        <- allocateParty "Lawyer"
+  client        <- allocateParty "Client"
+  agent         <- allocateParty "AIAgent"
+  court         <- allocateParty "Court"
+  opposing      <- allocateParty "OpposingCounsel"
+  recordsOffice <- allocateParty "RecordsOffice"
+  now <- getTime
+  prop <- submit lawyer do
+    createCmd MandateProposal with
+      professional = lawyer; client = client; agent = agent
+      matterHash = "sha256:matter-0001"
+      allowed = [DraftDocument, SummarizeRecords]
+      feeCapCents = 5000
+      payees = [recordsOffice]
+      expires = addRelTime now (days 30)
+  mandate <- submit client do exerciseCmd prop Accept
+  pure World with
+    lawyer = lawyer; client = client; agent = agent; court = court
+    opposing = opposing; recordsOffice = recordsOffice; mandate = mandate
+
+-- 1. Happy path: agent drafts, lawyer approves, court sees the receipt.
+testHappyPath : Script ()
+testHappyPath = do
+  w <- setup
+  draft <- submit w.agent do
+    exerciseCmd w.mandate ProduceDraft with
+      kind = DraftDocument; inputHash = "sha256:in"; outputHash = "sha256:out"
+      modelId = "model-x@2026-10"
+  rw <- submit w.lawyer do
+    exerciseCmd draft Approve with
+      citationsChecked = True; reviewNoteHash = "sha256:note"; discloseTo = [w.court]
+  seen <- queryContractId w.court rw
+  assertMsg "Court should see the review receipt" (isSome seen)
+  pure ()
+
+-- 2. Agent cannot take an action the mandate doesn't list.
+testActionOutsideMandate : Script ()
+testActionOutsideMandate = do
+  w <- setup
+  submitMustFail w.agent do
+    exerciseCmd w.mandate ProduceDraft with
+      kind = SendClientUpdate; inputHash = "x"; outputHash = "y"; modelId = "m"
+
+-- 3. Agent cannot approve its own work.
+testAgentCannotSelfApprove : Script ()
+testAgentCannotSelfApprove = do
+  w <- setup
+  draft <- submit w.agent do
+    exerciseCmd w.mandate ProduceDraft with
+      kind = DraftDocument; inputHash = "x"; outputHash = "y"; modelId = "m"
+  submitMustFail w.agent do
+    exerciseCmd draft Approve with
+      citationsChecked = True; reviewNoteHash = "n"; discloseTo = []
+
+-- 4. Agent cannot create reviewed work directly, bypassing the lawyer.
+testAgentCannotForgeReview : Script ()
+testAgentCannotForgeReview = do
+  w <- setup
+  now <- getTime
+  submitMustFail w.agent do
+    createCmd ReviewedWork with
+      professional = w.lawyer; client = w.client; agent = w.agent
+      matterHash = "sha256:matter-0001"; kind = DraftDocument
+      inputHash = "x"; outputHash = "y"; modelId = "m"
+      citationsChecked = True; reviewNoteHash = "n"
+      discloseTo = [w.court]; reviewedAt = now
+
+-- 5. Approval is blocked if citations weren't checked.
+testUncheckedCitationsBlocked : Script ()
+testUncheckedCitationsBlocked = do
+  w <- setup
+  draft <- submit w.agent do
+    exerciseCmd w.mandate ProduceDraft with
+      kind = DraftDocument; inputHash = "x"; outputHash = "y"; modelId = "m"
+  submitMustFail w.lawyer do
+    exerciseCmd draft Approve with
+      citationsChecked = False; reviewNoteHash = "n"; discloseTo = [w.court]
+
+-- 6. Fees: approved payee under the cap works; over cap or wrong payee fails.
+testFeeLimits : Script ()
+testFeeLimits = do
+  w <- setup
+  (m2, _) <- submit w.agent do
+    exerciseCmd w.mandate PayFee with
+      payee = w.recordsOffice; amountCents = 3000; memoHash = "records-copy"
+  submitMustFail w.agent do
+    exerciseCmd m2 PayFee with
+      payee = w.recordsOffice; amountCents = 2500; memoHash = "over-cap"
+  submitMustFail w.agent do
+    exerciseCmd m2 PayFee with
+      payee = w.opposing; amountCents = 100; memoHash = "wrong-payee"
+
+-- 7. Client revokes; agent is locked out.
+testRevocation : Script ()
+testRevocation = do
+  w <- setup
+  submit w.client do exerciseCmd w.mandate RevokeByClient
+  submitMustFail w.agent do
+    exerciseCmd w.mandate ProduceDraft with
+      kind = DraftDocument; inputHash = "x"; outputHash = "y"; modelId = "m"
+
+-- 8. Expired mandate: agent can't act after the end date.
+testExpiry : Script ()
+testExpiry = do
+  w <- setup
+  passTime (days 31)
+  submitMustFail w.agent do
+    exerciseCmd w.mandate ProduceDraft with
+      kind = DraftDocument; inputHash = "x"; outputHash = "y"; modelId = "m"
+
+-- 9. Privacy: opposing counsel sees nothing; court sees only what was disclosed.
+testPrivacy : Script ()
+testPrivacy = do
+  w <- setup
+  draft <- submit w.agent do
+    exerciseCmd w.mandate ProduceDraft with
+      kind = DraftDocument; inputHash = "x"; outputHash = "y"; modelId = "m"
+  oppMandates <- query @SupervisionMandate w.opposing
+  oppDrafts   <- query @AgentDraft w.opposing
+  courtDrafts <- query @AgentDraft w.court
+  assertMsg "Opposing counsel must not see the mandate" (null oppMandates)
+  assertMsg "Opposing counsel must not see drafts" (null oppDrafts)
+  assertMsg "Court must not see unreviewed drafts" (null courtDrafts)
+  pure ()

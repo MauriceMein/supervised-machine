@@ -1,0 +1,10 @@
+# Target: Daml SDK 3.7.1 (dpm). No contract keys used.
+# Install with: dpm install package
+sdk-version: 3.7.1
+name: supervised-machine
+version: 0.1.0
+source: daml
+dependencies:
+  - daml-prim
+  - daml-stdlib
+  - daml-script
