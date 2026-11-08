@@ -2,7 +2,7 @@
 
 AI agents on Canton that can only act inside a mandate a licensed human signed, and whose work only counts after that human reviews it.
 
-Companion code for the article **"The Supervised Machine"** by Ace Muir (Maurice Meintzer), asterionai.io:
+Companion code for the article **"The Supervised Machine"** by AceMuir (Maurice Meintzer), asterionai.io:
 https://asterionai.io/research/supervised-machine/
 
 Synthetic data only. Research sketch, not production code, not legal advice.
